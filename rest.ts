@@ -1,788 +1,629 @@
-// rest.ts — REST v3 API under /api/v3. Every reply is application/json with a non-empty
-// X-GitHub-Request-Id; errors are JSON {message}; unknown routes 404 JSON; malformed JSON 400.
+// rest.ts — the GitHub REST v3 surface the checks exercise: repos, contents,
+// labels, issues, pulls, git refs, pagination. Every response is JSON with an
+// X-GitHub-Request-Id; writes are validated and answered with the status the
+// real API uses (201 create, 200 update, 204 delete, 404 missing, 409 stale
+// sha, 422 validation).
 
-import { parseCommit, buildTree } from './gitobj.ts';
-import { type Store, type Repo, type Issue, type Pull } from './store.ts';
+import {
+  objects, commitMeta, repos, repoKey, newRepo, repoJson, issueJson, pullJson,
+  storeObj, makeCommit, filesOfCommit, treeFromFiles, diffFiles, hasConflict,
+  invalidateRepoGit, findMergeBase, parseTree,
+  allocIssueId, allocPullId,
+  VIEWER, FIXED_DATE, ZERO,
+  type Repo, type Issue, type Pull,
+} from './store.ts';
+import { sendJson, sendEmpty, parseJsonBody, isObject, type Ctx } from './http-util.ts';
 
-export interface RestContext {
-  store: Store;
-  requestId: string;
-  baseUrl: string;
-  authenticated: boolean;
+const OAUTH = { 'x-oauth-scopes': 'repo' };
+
+function j(ctx: Ctx, status: number, body: unknown, extra?: Record<string, string>): void {
+  sendJson(ctx, status, body, { ...OAUTH, ...extra });
 }
 
-let requestCounter = 0;
-
-export function nextRequestId(): string {
-  requestCounter += 1;
-  return `req-${Date.now().toString(36)}-${requestCounter.toString(36)}`;
+function notFound(ctx: Ctx): void {
+  j(ctx, 404, { message: 'Not Found' });
 }
 
-export interface RestResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: Buffer | null;
+function badBody(ctx: Ctx): unknown | null {
+  const v = parseJsonBody(ctx);
+  if (v === null || !isObject(v)) {
+    j(ctx, 400, { message: 'Problems parsing JSON' });
+    return null;
+  }
+  return v;
 }
 
-function json(ctx: RestContext, status: number, value: unknown, extraHeaders: Record<string, string> = {}): RestResponse {
-  const body = Buffer.from(JSON.stringify(value), 'utf8');
-  return {
-    status,
-    headers: {
-      'content-type': 'application/json',
-      'x-github-request-id': ctx.requestId,
-      'x-ratelimit-limit': '5000',
-      'x-ratelimit-remaining': '4999',
-      ...extraHeaders,
-    },
-    body,
-  };
+function getRepo(ctx: Ctx, owner: string, name: string): Repo | null {
+  return repos.get(repoKey(owner, name)) ?? null;
 }
 
-function error(ctx: RestContext, status: number, message: string): RestResponse {
-  return json(ctx, status, { message });
+/** The branch a contents operation targets: body.branch, ?ref=, or default. */
+function targetBranch(repo: Repo, body: Record<string, unknown> | null, ctx: Ctx): string {
+  if (body && typeof body.branch === 'string' && body.branch !== '') return body.branch;
+  const ref = ctx.query.get('ref');
+  if (ref) return ref;
+  return repo.defaultBranch;
 }
 
-function noContent(ctx: RestContext): RestResponse {
-  return {
-    status: 204,
-    headers: { 'x-github-request-id': ctx.requestId },
-    body: null,
-  };
+/** The tip commit of a branch, or null. */
+function branchTip(repo: Repo, branch: string): string | null {
+  return repo.refs.get(`refs/heads/${branch}`) ?? null;
 }
 
-// ---------------------------------------------------------------------------------------------
-// shapes
-// ---------------------------------------------------------------------------------------------
+export function handleRest(ctx: Ctx): void {
+  const auth = ctx.req.headers.authorization;
+  if (!auth || auth.trim() === '') {
+    j(ctx, 401, { message: 'Requires authentication' });
+    return;
+  }
+  const { method, segments } = ctx;
 
-function userShape(store: Store, login: string): { login: string; id: number; type: string; avatar_url: string } {
-  const user = store.users.get(login) ?? store.viewer;
-  return {
-    login: user.login,
-    id: user.id,
-    type: 'User',
-    avatar_url: `https://avatars.githubusercontent.invalid/u/${user.id}`,
-  };
+  // GET /api/v3/ — the API root.
+  if (segments.length === 0) {
+    if (method !== 'GET') return notFound(ctx);
+    j(ctx, 200, {
+      current_user_url: '/api/v3/user',
+      current_user_repositories_url: '/api/v3/user/repos',
+      repository_url: '/api/v3/repos/{owner}/{repo}',
+      user_url: '/api/v3/users/{user}',
+    });
+    return;
+  }
+
+  if (segments[0] === 'meta' && segments.length === 1) {
+    if (method !== 'GET') return notFound(ctx);
+    j(ctx, 200, { installed_version: '1.0.0', verifiable_password_authentication: false });
+    return;
+  }
+
+  if (segments[0] === 'user') {
+    if (segments.length === 1 && method === 'GET') {
+      j(ctx, 200, { login: VIEWER.login, id: VIEWER.id, name: VIEWER.name, email: VIEWER.email, type: 'User' });
+      return;
+    }
+    if (segments[1] === 'repos') {
+      if (method === 'POST') return createRepo(ctx);
+      if (method === 'GET') return listUserRepos(ctx);
+      return notFound(ctx);
+    }
+    return notFound(ctx);
+  }
+
+  if (segments[0] === 'repos') {
+    if (segments.length < 3) return notFound(ctx);
+    const owner = segments[1];
+    const name = segments[2];
+    const repo = getRepo(ctx, owner, name);
+    if (!repo) return notFound(ctx);
+    const rest = segments.slice(3);
+    if (rest.length === 0) return repoRoot(ctx, repo);
+    if (rest[0] === 'branches' && rest.length === 1 && method === 'GET') return listBranches(ctx, repo);
+    if (rest[0] === 'commits' && rest.length === 1 && method === 'GET') return listCommits(ctx, repo);
+    if (rest[0] === 'contents') return contents(ctx, repo, rest.slice(1));
+    if (rest[0] === 'labels') return labels(ctx, repo, rest.slice(1));
+    if (rest[0] === 'issues') return issues(ctx, repo, rest.slice(1));
+    if (rest[0] === 'pulls') return pulls(ctx, repo, rest.slice(1));
+    if (rest[0] === 'git' && rest[1] === 'refs') return gitRefs(ctx, repo, rest.slice(2));
+    return notFound(ctx);
+  }
+
+  return notFound(ctx);
 }
 
-function repoShape(ctx: RestContext, repo: Repo): Record<string, unknown> {
-  return {
-    id: repo.id,
-    name: repo.name,
-    full_name: repo.fullName,
-    owner: userShape(ctx.store, repo.owner),
-    private: repo.isPrivate,
-    description: repo.description,
-    default_branch: repo.defaultBranch,
-    html_url: `${ctx.baseUrl}/${repo.fullName}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}`,
-    created_at: '2025-01-01T00:00:00Z',
-    updated_at: '2025-01-01T00:00:00Z',
-  };
+// ---------------------------------------------------------------------------
+// Repos.
+// ---------------------------------------------------------------------------
+
+function createRepo(ctx: Ctx): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  if (name === '') {
+    j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Repository', field: 'name', code: 'missing' }] });
+    return;
+  }
+  if (repos.has(repoKey(VIEWER.login, name))) {
+    j(ctx, 422, { message: 'Repository creation failed.', errors: [{ resource: 'Repository', field: 'name', code: 'custom', message: 'name already exists on this account' }] });
+    return;
+  }
+  const repo = newRepo(
+    VIEWER.login,
+    name,
+    typeof body.description === 'string' ? body.description : '',
+    body.private === true,
+  );
+  if (typeof body.default_branch === 'string' && body.default_branch !== '') repo.defaultBranch = body.default_branch;
+  j(ctx, 201, repoJson(repo));
 }
 
-function labelShape(label: { name: string; color: string; description: string }): Record<string, unknown> {
-  return { name: label.name, color: label.color, description: label.description };
-}
-
-function issueShape(ctx: RestContext, repo: Repo, issue: Issue): Record<string, unknown> {
-  return {
-    id: issue.id,
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
-    labels: issue.labels.map((name) => labelShape(repo.labels.get(name) ?? { name, color: '000000', description: '' })),
-    comments: issue.comments.length,
-    user: userShape(ctx.store, repo.owner),
-    created_at: issue.createdAt,
-    updated_at: issue.updatedAt,
-    html_url: `${ctx.baseUrl}/${repo.fullName}/issues/${issue.number}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}/issues/${issue.number}`,
-  };
-}
-
-/** Serialized issue shape, cached on the issue (invalidated on mutation). */
-function issueJson(ctx: RestContext, repo: Repo, issue: Issue): Buffer {
-  if (issue.jsonCache) return issue.jsonCache;
-  const buffer = Buffer.from(JSON.stringify(issueShape(ctx, repo, issue)), 'utf8');
-  issue.jsonCache = buffer;
-  return buffer;
-}
-
-function jsonRaw(ctx: RestContext, status: number, body: Buffer, extraHeaders: Record<string, string> = {}): RestResponse {
-  return {
-    status,
-    headers: {
-      'content-type': 'application/json',
-      'x-github-request-id': ctx.requestId,
-      'x-ratelimit-limit': '5000',
-      'x-ratelimit-remaining': '4999',
-      ...extraHeaders,
-    },
-    body,
-  };
-}
-
-function commentShape(ctx: RestContext, repo: Repo, issue: Issue, comment: { id: number; body: string; createdAt: string }): Record<string, unknown> {
-  return {
-    id: comment.id,
-    body: comment.body,
-    user: userShape(ctx.store, repo.owner),
-    created_at: comment.createdAt,
-    updated_at: comment.createdAt,
-    html_url: `${ctx.baseUrl}/${repo.fullName}/issues/${issue.number}#issuecomment-${comment.id}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}/issues/${issue.number}/comments/${comment.id}`,
-  };
-}
-
-function pullShape(ctx: RestContext, repo: Repo, pull: Pull): Record<string, unknown> {
-  return {
-    id: pull.id,
-    number: pull.number,
-    title: pull.title,
-    body: pull.body,
-    state: pull.state,
-    merged: pull.merged,
-    merged_at: pull.mergedAt,
-    merge_commit_sha: pull.mergeCommitSha,
-    head: {
-      ref: pull.headRef,
-      sha: pull.headSha,
-      label: `${repo.owner}:${pull.headRef}`,
-      repo: repoShape(ctx, repo),
-    },
-    base: {
-      ref: pull.baseRef,
-      sha: pull.baseSha,
-      label: `${repo.owner}:${pull.baseRef}`,
-      repo: repoShape(ctx, repo),
-    },
-    user: userShape(ctx.store, repo.owner),
-    created_at: pull.createdAt,
-    updated_at: pull.updatedAt,
-    html_url: `${ctx.baseUrl}/${repo.fullName}/pull/${pull.number}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}/pulls/${pull.number}`,
-  };
-}
-
-// ---------------------------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------------------------
-
-type Query = Record<string, string>;
-
-function parseQuery(search: string): Query {
-  const out: Query = {};
-  if (!search) return out;
-  const params = new URLSearchParams(search);
-  for (const [key, value] of params) out[key] = value;
-  return out;
-}
-
-function pageOf<T>(items: T[], query: Query): { page: T[]; total: number } {
-  const perPage = Math.max(1, Math.min(100, Number.parseInt(query.per_page ?? '30', 10) || 30));
-  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
-  const total = items.length;
+function listUserRepos(ctx: Ctx): void {
+  const perPage = Math.max(1, Math.min(100, parseInt(ctx.query.get('per_page') ?? '30', 10) || 30));
+  const page = Math.max(1, parseInt(ctx.query.get('page') ?? '1', 10) || 1);
+  const mine = [...repos.values()].filter((r) => r.owner === VIEWER.login);
+  const total = mine.length;
   const start = (page - 1) * perPage;
-  const pageItems = items.slice(start, start + perPage);
-  return { page: pageItems, total };
-}
-
-function linkHeader(ctx: RestContext, path: string, query: Query, total: number): string | undefined {
-  const perPage = Math.max(1, Math.min(100, Number.parseInt(query.per_page ?? '30', 10) || 30));
-  const page = Math.max(1, Number.parseInt(query.page ?? '1', 10) || 1);
-  const totalPages = Math.max(1, Math.ceil(total / perPage));
-  if (totalPages <= 1) return undefined;
+  const slice = mine.slice(start, start + perPage);
+  const body = `[${slice.map((r) => repoJson(r)).join(',')}]`;
+  const host = ctx.req.headers.host ?? '127.0.0.1';
+  const base = `http://${host}/api/v3/user/repos?per_page=${perPage}`;
   const links: string[] = [];
-  const build = (p: number, rel: string): string => {
-    const params = new URLSearchParams(query);
-    params.set('page', String(p));
-    params.set('per_page', String(perPage));
-    return `<${ctx.baseUrl}${path}?${params.toString()}>; rel="${rel}"`;
-  };
-  if (page < totalPages) links.push(build(page + 1, 'next'));
-  if (page > 1) links.push(build(page - 1, 'prev'));
-  links.push(build(1, 'first'));
-  links.push(build(totalPages, 'last'));
-  return links.join(', ');
+  if (start + perPage < total) links.push(`<${base}&page=${page + 1}>; rel="next"`);
+  if (page > 1) links.push(`<${base}&page=${page - 1}>; rel="prev"`);
+  links.push(`<${base}&page=1>; rel="first"`);
+  const lastPage = Math.max(1, Math.ceil(total / perPage));
+  links.push(`<${base}&page=${lastPage}>; rel="last"`);
+  j(ctx, 200, body, { link: links.join(', ') });
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value);
+function repoRoot(ctx: Ctx, repo: Repo): void {
+  if (ctx.method === 'GET') {
+    j(ctx, 200, repoJson(repo));
+    return;
+  }
+  if (ctx.method === 'PATCH') {
+    const body = badBody(ctx);
+    if (body === null) return;
+    if (typeof body.description === 'string') repo.description = body.description;
+    if (typeof body.default_branch === 'string' && body.default_branch !== '') repo.defaultBranch = body.default_branch;
+    if (typeof body.private === 'boolean') repo.private = body.private;
+    repo.repoJson = null;
+    j(ctx, 200, repoJson(repo));
+    return;
+  }
+  if (ctx.method === 'DELETE') {
+    repos.delete(repoKey(repo.owner, repo.name));
+    sendEmpty(ctx, 204, OAUTH);
+    return;
+  }
+  return notFound(ctx);
 }
 
-function stringField(body: Record<string, unknown>, key: string): string | undefined {
-  const value = body[key];
-  return typeof value === 'string' ? value : undefined;
+function listBranches(ctx: Ctx, repo: Repo): void {
+  const out = [...repo.refs.entries()]
+    .filter(([n]) => n.startsWith('refs/heads/'))
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([name, oid]) => ({ name: name.slice('refs/heads/'.length), commit: { sha: oid } }));
+  j(ctx, 200, out);
 }
 
-function diffLines(oldText: string, newText: string): { additions: number; deletions: number } {
-  const oldLines = oldText === '' ? [] : oldText.split('\n');
-  const newLines = newText === '' ? [] : newText.split('\n');
-  const m = oldLines.length;
-  const n = newLines.length;
-  // LCS dynamic programming; files here are small.
-  const dp: number[][] = Array.from({ length: m + 1 }, () => new Array<number>(n + 1).fill(0));
-  for (let i = m - 1; i >= 0; i -= 1) {
-    for (let j = n - 1; j >= 0; j -= 1) {
-      dp[i][j] = oldLines[i] === newLines[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+function listCommits(ctx: Ctx, repo: Repo): void {
+  const branch = ctx.query.get('sha') ?? repo.defaultBranch;
+  const tip = branchTip(repo, branch);
+  if (!tip) return notFound(ctx);
+  const out: unknown[] = [];
+  const seen = new Set<string>();
+  let cur: string | null = tip;
+  while (cur && !seen.has(cur) && out.length < 1000) {
+    seen.add(cur);
+    const meta = commitMeta.get(cur);
+    if (!meta) break;
+    out.push({
+      sha: cur,
+      commit: {
+        message: meta.message,
+        author: { name: VIEWER.name, email: VIEWER.email, date: FIXED_DATE },
+        committer: { name: VIEWER.name, email: VIEWER.email, date: FIXED_DATE },
+        tree: { sha: meta.tree },
+      },
+      author: { login: VIEWER.login, id: VIEWER.id },
+      committer: { login: VIEWER.login, id: VIEWER.id },
+      parents: meta.parents.map((p) => ({ sha: p })),
+    });
+    cur = meta.parents[0] ?? null;
+  }
+  j(ctx, 200, out);
+}
+
+// ---------------------------------------------------------------------------
+// Contents.
+// ---------------------------------------------------------------------------
+
+function contents(ctx: Ctx, repo: Repo, rest: string[]): void {
+  const path = rest.join('/');
+  if (ctx.method === 'GET') return getContents(ctx, repo, path);
+  if (ctx.method === 'PUT') return putContents(ctx, repo, path);
+  if (ctx.method === 'DELETE') return deleteContents(ctx, repo, path);
+  return notFound(ctx);
+}
+
+function getContents(ctx: Ctx, repo: Repo, path: string): void {
+  const branch = ctx.query.get('ref') ?? repo.defaultBranch;
+  const tip = branchTip(repo, branch);
+  if (!tip) return notFound(ctx);
+  const files = filesOfCommit(tip);
+  const file = files.get(path);
+  if (file) {
+    const blob = objects.get(file.oid);
+    const content = blob ? blob.data.toString('base64') : '';
+    j(ctx, 200, {
+      type: 'file',
+      encoding: 'base64',
+      size: file.size,
+      name: path.split('/').pop() ?? path,
+      path,
+      content,
+      sha: file.oid,
+    });
+    return;
+  }
+  // Directory listing: the immediate children of `path` (or the root).
+  const prefix = path === '' ? '' : path + '/';
+  const children = new Map<string, { type: 'file' | 'dir'; oid: string; size: number }>();
+  for (const [p, f] of files) {
+    if (!p.startsWith(prefix)) continue;
+    const rest = p.slice(prefix.length);
+    const slash = rest.indexOf('/');
+    if (slash === -1) children.set(rest, { type: 'file', oid: f.oid, size: f.size });
+    else {
+      const dir = rest.slice(0, slash);
+      if (!children.has(dir)) children.set(dir, { type: 'dir', oid: '', size: 0 });
     }
   }
-  const common = dp[0][0];
-  return { additions: n - common, deletions: m - common };
+  if (children.size === 0) return notFound(ctx);
+  const out = [...children.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([name, c]) => ({
+      type: c.type,
+      name,
+      path: prefix + name,
+      sha: c.type === 'file' ? c.oid : treeOidOf(tip, prefix + name),
+      size: c.size,
+    }));
+  j(ctx, 200, out);
 }
 
-function countLines(text: string): number {
-  if (text === '') return 0;
-  return text.split('\n').length;
-}
-
-export interface MergeResult {
-  ok: boolean;
-  sha?: string;
-  message: string;
-  status?: number;
-}
-
-/**
- * Squash-merge an open pull request onto its base branch. Shared by REST and GraphQL.
- * Conflict rule: a path the PR changes whose content at the current base tip differs from
- * its content at the merge base blocks the merge.
- */
-export function mergePullRequest(store: Store, repo: Repo, pull: Pull): MergeResult {
-  if (pull.state !== 'open') return { ok: false, message: 'Pull request is not open', status: 405 };
-  const baseTip = repo.branchTip(pull.baseRef);
-  if (!baseTip) return { ok: false, message: 'Not Found', status: 404 };
-  const mergeBase = repo.mergeBase(pull.headSha, baseTip);
-  const baseTree = repo.treeOf(mergeBase ?? pull.baseSha);
-  const headTree = repo.treeOf(pull.headSha);
-  const tipTree = repo.treeOf(baseTip);
-  const diff = repo.diffTrees(baseTree, headTree);
-  const tipFiles = tipTree ? repo.flattenTree(tipTree) : new Map<string, { oid: string; mode: string }>();
-  const baseFiles = baseTree ? repo.flattenTree(baseTree) : new Map<string, { oid: string; mode: string }>();
-  for (const change of diff) {
-    const atTip = tipFiles.get(change.path)?.oid;
-    const atBase = baseFiles.get(change.path)?.oid;
-    if (atTip !== atBase) return { ok: false, message: 'Merge conflict', status: 405 };
+/** The tree oid of a directory inside a commit's tree (or ''). */
+function treeOidOf(commitOid: string, dirPath: string): string {
+  const meta = commitMeta.get(commitOid);
+  if (!meta) return '';
+  let treeOid = meta.tree;
+  for (const part of dirPath.split('/')) {
+    if (part === '') continue;
+    const tree = objects.get(treeOid);
+    if (!tree) return '';
+    const entry = parseTree(tree.data).find((e) => e.name === part && e.mode === '40000');
+    if (!entry) return '';
+    treeOid = entry.oid;
   }
-  let mergedTree = tipTree;
-  for (const change of diff) {
-    if (change.status === 'removed') mergedTree = repo.setPath(mergedTree, change.path, null);
-    else if (change.newOid) mergedTree = repo.setPath(mergedTree, change.path, change.newOid);
+  return treeOid;
+}
+
+function putContents(ctx: Ctx, repo: Repo, path: string): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  const branch = targetBranch(repo, body, ctx);
+  const tip = branchTip(repo, branch);
+  const message = typeof body.message === 'string' ? body.message : 'Update';
+  const contentB64 = typeof body.content === 'string' ? body.content : '';
+  const sha = typeof body.sha === 'string' ? body.sha : null;
+  const data = Buffer.from(contentB64, 'base64');
+  const files = tip ? filesOfCommit(tip) : new Map<string, { oid: string; size: number }>();
+  const existing = files.get(path);
+  if (existing) {
+    if (sha === null || sha !== existing.oid) {
+      j(ctx, 409, { message: 'sha does not match the current blob' });
+      return;
+    }
+  } else if (sha !== null) {
+    j(ctx, 409, { message: 'sha does not match the current blob' });
+    return;
   }
-  const finalTree = mergedTree ?? repo.putObject('tree', buildTree([]));
-  const message = `Merge pull request #${pull.number} from ${repo.owner}/${pull.headRef}`;
-  const mergeSha = store.makeCommit(repo, finalTree, [baseTip], message);
-  repo.refs.set(`refs/heads/${pull.baseRef}`, mergeSha);
+  const blobOid = storeObj('blob', data);
+  const next = new Map(files);
+  next.set(path, { oid: blobOid, size: data.length });
+  const treeOid = treeFromFiles(next);
+  const parents = tip ? [tip] : [];
+  const commitOid = makeCommit(treeOid, parents, message);
+  repo.refs.set(`refs/heads/${branch}`, commitOid);
+  invalidateRepoGit(repo);
+  j(ctx, existing ? 200 : 201, {
+    content: { type: 'file', name: path.split('/').pop() ?? path, path, sha: blobOid, size: data.length, encoding: 'base64', content: contentB64 },
+    commit: { sha: commitOid, message },
+  });
+}
+
+function deleteContents(ctx: Ctx, repo: Repo, path: string): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  const branch = targetBranch(repo, body, ctx);
+  const tip = branchTip(repo, branch);
+  if (!tip) return notFound(ctx);
+  const files = filesOfCommit(tip);
+  const existing = files.get(path);
+  if (!existing) return notFound(ctx);
+  const sha = typeof body.sha === 'string' ? body.sha : null;
+  if (sha === null || sha !== existing.oid) {
+    j(ctx, 409, { message: 'sha does not match the current blob' });
+    return;
+  }
+  const message = typeof body.message === 'string' ? body.message : 'Delete';
+  const next = new Map(files);
+  next.delete(path);
+  const treeOid = treeFromFiles(next);
+  const commitOid = makeCommit(treeOid, [tip], message);
+  repo.refs.set(`refs/heads/${branch}`, commitOid);
+  invalidateRepoGit(repo);
+  j(ctx, 200, { commit: { sha: commitOid, message } });
+}
+
+// ---------------------------------------------------------------------------
+// Labels.
+// ---------------------------------------------------------------------------
+
+function labels(ctx: Ctx, repo: Repo, rest: string[]): void {
+  if (ctx.method === 'GET' && rest.length === 0) {
+    j(ctx, 200, [...repo.labels.values()].map((l) => ({ name: l.name, color: l.color })));
+    return;
+  }
+  if (ctx.method === 'POST' && rest.length === 0) {
+    const body = badBody(ctx);
+    if (body === null) return;
+    const name = typeof body.name === 'string' ? body.name : '';
+    if (name === '') {
+      j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Label', field: 'name', code: 'missing' }] });
+      return;
+    }
+    const color = typeof body.color === 'string' ? body.color : 'ededed';
+    if (repo.labels.has(name)) {
+      j(ctx, 200, { name, color: repo.labels.get(name)!.color });
+      return;
+    }
+    repo.labels.set(name, { name, color });
+    j(ctx, 201, { name, color });
+    return;
+  }
+  return notFound(ctx);
+}
+
+// ---------------------------------------------------------------------------
+// Issues.
+// ---------------------------------------------------------------------------
+
+function issues(ctx: Ctx, repo: Repo, rest: string[]): void {
+  if (rest.length === 0) {
+    if (ctx.method === 'GET') return listIssues(ctx, repo);
+    if (ctx.method === 'POST') return createIssue(ctx, repo);
+    return notFound(ctx);
+  }
+  const n = Number(rest[0]);
+  if (!Number.isInteger(n)) return notFound(ctx);
+  const issue = repo.issues.find((i) => i.number === n);
+  if (!issue) return notFound(ctx);
+  if (rest.length === 1) {
+    if (ctx.method === 'GET') { j(ctx, 200, issueJson(repo, issue)); return; }
+    if (ctx.method === 'PATCH') return patchIssue(ctx, repo, issue);
+    return notFound(ctx);
+  }
+  if (rest[1] === 'comments') {
+    if (ctx.method === 'GET') {
+      j(ctx, 200, issue.comments.map((c) => ({ id: c.id, body: c.body, user: { login: VIEWER.login, id: VIEWER.id }, created_at: FIXED_DATE })));
+      return;
+    }
+    if (ctx.method === 'POST') {
+      const body = badBody(ctx);
+      if (body === null) return;
+      const text = typeof body.body === 'string' ? body.body : '';
+      const comment = { id: repo.nextCommentId++, body: text };
+      issue.comments.push(comment);
+      issue.json = '';
+      j(ctx, 201, { id: comment.id, body: text, user: { login: VIEWER.login, id: VIEWER.id }, created_at: FIXED_DATE });
+      return;
+    }
+    return notFound(ctx);
+  }
+  return notFound(ctx);
+}
+
+function listIssues(ctx: Ctx, repo: Repo): void {
+  const state = ctx.query.get('state') ?? 'open';
+  const direction = ctx.query.get('direction') ?? 'desc';
+  let list = repo.issues;
+  if (state !== 'all') list = list.filter((i) => i.state === state);
+  const sorted = [...list].sort((a, b) => (direction === 'asc' ? a.number - b.number : b.number - a.number));
+  j(ctx, 200, `[${sorted.map((i) => issueJson(repo, i)).join(',')}]`);
+}
+
+function createIssue(ctx: Ctx, repo: Repo): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  const title = typeof body.title === 'string' ? body.title : '';
+  if (title === '') {
+    j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'title', code: 'missing' }] });
+    return;
+  }
+  const labels = Array.isArray(body.labels) ? body.labels.filter((l): l is string => typeof l === 'string') : [];
+  for (const l of labels) {
+    if (!repo.labels.has(l)) {
+      j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'labels', code: 'custom', message: `label ${l} does not exist` }] });
+      return;
+    }
+  }
+  const issue: Issue = {
+    id: allocIssueId(),
+    number: repo.nextNumber++,
+    title,
+    body: typeof body.body === 'string' ? body.body : '',
+    state: 'open',
+    labels,
+    comments: [],
+    json: '',
+    gqlId: '',
+  };
+  issue.gqlId = '';
+  repo.issues.push(issue);
+  j(ctx, 201, issueJson(repo, issue));
+}
+
+function patchIssue(ctx: Ctx, repo: Repo, issue: Issue): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
+  if (typeof body.title === 'string') issue.title = body.title;
+  if (typeof body.body === 'string') issue.body = body.body;
+  if (Array.isArray(body.labels)) {
+    const labels = body.labels.filter((l): l is string => typeof l === 'string');
+    for (const l of labels) {
+      if (!repo.labels.has(l)) {
+        j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Issue', field: 'labels', code: 'custom', message: `label ${l} does not exist` }] });
+        return;
+      }
+    }
+    issue.labels = labels;
+  }
+  issue.json = '';
+  j(ctx, 200, issueJson(repo, issue));
+}
+
+// ---------------------------------------------------------------------------
+// Pull requests.
+// ---------------------------------------------------------------------------
+
+function pulls(ctx: Ctx, repo: Repo, rest: string[]): void {
+  if (rest.length === 0) {
+    if (ctx.method === 'GET') {
+      const state = ctx.query.get('state') ?? 'open';
+      let list = repo.pulls;
+      if (state !== 'all') list = list.filter((p) => p.state === state);
+      j(ctx, 200, `[${list.map((p) => pullJson(repo, p)).join(',')}]`);
+      return;
+    }
+    if (ctx.method === 'POST') return createPull(ctx, repo);
+    return notFound(ctx);
+  }
+  const n = Number(rest[0]);
+  if (!Number.isInteger(n)) return notFound(ctx);
+  const pull = repo.pulls.find((p) => p.number === n);
+  if (!pull) return notFound(ctx);
+  if (rest.length === 1) {
+    if (ctx.method === 'GET') { j(ctx, 200, pullJson(repo, pull)); return; }
+    return notFound(ctx);
+  }
+  if (rest[1] === 'files' && rest.length === 2 && ctx.method === 'GET') {
+    j(ctx, 200, pull.files);
+    return;
+  }
+  if (rest[1] === 'merge' && rest.length === 2 && ctx.method === 'PUT') return mergePull(ctx, repo, pull);
+  return notFound(ctx);
+}
+
+function createPull(ctx: Ctx, repo: Repo): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  const title = typeof body.title === 'string' ? body.title : '';
+  const headRaw = typeof body.head === 'string' ? body.head : '';
+  const baseRaw = typeof body.base === 'string' ? body.base : '';
+  const head = headRaw.includes(':') ? headRaw.split(':').pop()! : headRaw;
+  const base = baseRaw.includes(':') ? baseRaw.split(':').pop()! : baseRaw;
+  if (title === '' || head === '' || base === '') {
+    j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom', message: 'title, head and base are required' }] });
+    return;
+  }
+  const headSha = branchTip(repo, head);
+  const baseSha = branchTip(repo, base);
+  if (!headSha || !baseSha) {
+    j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom', message: 'head or base branch does not exist' }] });
+    return;
+  }
+  const mergeBase = findMergeBase(headSha, new Set([baseSha])) ?? baseSha;
+  const files = diffFiles(filesOfCommit(mergeBase), filesOfCommit(headSha));
+  const pull: Pull = {
+    id: allocPullId(),
+    number: repo.nextNumber++,
+    title,
+    body: typeof body.body === 'string' ? body.body : '',
+    state: 'open',
+    merged: false,
+    mergedAt: null,
+    mergeSha: null,
+    headRef: head,
+    baseRef: base,
+    headSha,
+    baseSha,
+    mergeBase,
+    files,
+    json: null,
+    gqlId: '',
+  };
+  repo.pulls.push(pull);
+  j(ctx, 201, pullJson(repo, pull));
+}
+
+function mergePull(ctx: Ctx, repo: Repo, pull: Pull): void {
+  const body = badBody(ctx);
+  if (body === null) return;
+  if (pull.state === 'closed') {
+    j(ctx, 405, { message: 'Pull request is already closed' });
+    return;
+  }
+  const baseTip = branchTip(repo, pull.baseRef);
+  const headTip = branchTip(repo, pull.headRef);
+  if (!baseTip || !headTip) {
+    j(ctx, 405, { message: 'Head or base branch is missing' });
+    return;
+  }
+  const mergeBaseFiles = filesOfCommit(pull.mergeBase);
+  const baseFiles = filesOfCommit(baseTip);
+  const headFiles = filesOfCommit(headTip);
+  if (hasConflict(mergeBaseFiles, baseFiles, headFiles, pull.files)) {
+    j(ctx, 405, { message: 'Merge conflict' });
+    return;
+  }
+  // The merge tree: the base tip's files, overlaid with the head's version of
+  // every file the PR touches.
+  const merged = new Map(baseFiles);
+  for (const f of pull.files) {
+    const h = headFiles.get(f.filename);
+    if (h) merged.set(f.filename, h);
+    else merged.delete(f.filename);
+  }
+  const treeOid = treeFromFiles(merged);
+  const message = typeof body.commit_message === 'string' && body.commit_message !== ''
+    ? body.commit_message
+    : `Merge pull request #${pull.number} from ${pull.headRef}`;
+  const commitOid = makeCommit(treeOid, [baseTip], message);
+  repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
   pull.state = 'closed';
   pull.merged = true;
-  pull.mergedAt = store.nowIso();
-  pull.mergeCommitSha = mergeSha;
-  pull.updatedAt = store.nowIso();
-  return { ok: true, sha: mergeSha, message };
+  pull.mergedAt = FIXED_DATE;
+  pull.mergeSha = commitOid;
+  pull.json = null;
+  invalidateRepoGit(repo);
+  j(ctx, 200, { sha: commitOid, merged: true, message });
 }
 
-// ---------------------------------------------------------------------------------------------
-// contents: commit a file change on a branch
-// ---------------------------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Git refs.
+// ---------------------------------------------------------------------------
 
-function commitFileChange(
-  ctx: RestContext,
-  repo: Repo,
-  branch: string,
-  path: string,
-  blobOid: string | null,
-  message: string,
-): { commitOid: string; createdBranch: boolean } {
-  const tip = repo.branchTip(branch);
-  let treeOid: string | undefined;
-  let parents: string[] = [];
-  let createdBranch = false;
-  if (tip !== undefined) {
-    const tree = repo.treeOf(tip);
-    if (tree === undefined) throw new Error('branch tip is not a commit');
-    treeOid = tree;
-    parents = [tip];
-  } else if (branch !== repo.defaultBranch && repo.refs.size > 0) {
-    // Create the branch from the default branch tip, then commit on it.
-    const defaultTip = repo.branchTip(repo.defaultBranch);
-    if (defaultTip === undefined) throw new Error('default branch has no commits');
-    const tree = repo.treeOf(defaultTip);
-    if (tree === undefined) throw new Error('default branch tip is not a commit');
-    treeOid = tree;
-    parents = [defaultTip];
-    createdBranch = true;
+function gitRefs(ctx: Ctx, repo: Repo, rest: string[]): void {
+  if (ctx.method === 'POST' && rest.length === 0) {
+    const body = badBody(ctx);
+    if (body === null) return;
+    const ref = typeof body.ref === 'string' ? body.ref : '';
+    const sha = typeof body.sha === 'string' ? body.sha : '';
+    if (!ref.startsWith('refs/') || !/^[0-9a-f]{40}$/.test(sha)) {
+      j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Reference', code: 'custom', message: 'ref and sha are required' }] });
+      return;
+    }
+    if (!objects.has(sha)) {
+      j(ctx, 422, { message: 'Validation Failed', errors: [{ resource: 'Reference', code: 'custom', message: 'object does not exist' }] });
+      return;
+    }
+    if (repo.refs.has(ref)) {
+      j(ctx, 422, { message: 'Reference already exists', errors: [{ resource: 'Reference', code: 'custom', message: 'reference already exists' }] });
+      return;
+    }
+    repo.refs.set(ref, sha);
+    invalidateRepoGit(repo);
+    j(ctx, 201, { ref, object: { sha, type: objects.get(sha)?.type ?? 'commit' } });
+    return;
   }
-  const newTree = repo.setPath(treeOid, path, blobOid);
-  const commitOid = ctx.store.makeCommit(repo, newTree, parents, message);
-  repo.refs.set(`refs/heads/${branch}`, commitOid);
-  return { commitOid, createdBranch };
-}
-
-// ---------------------------------------------------------------------------------------------
-// router
-// ---------------------------------------------------------------------------------------------
-
-export function handleRest(
-  ctx: RestContext,
-  method: string,
-  path: string,
-  search: string,
-  body: unknown,
-  bodyMalformed: boolean,
-): RestResponse {
-  const store = ctx.store;
-  const query = parseQuery(search);
-
-  if (bodyMalformed) return error(ctx, 400, 'Problems parsing JSON');
-
-  // GET /api/v3/ — root (public)
-  if (method === 'GET' && path === '/api/v3/') {
-    return json(ctx, 200, { current_user_url: `${ctx.baseUrl}/api/v3/user` }, { 'x-oauth-scopes': 'repo, user' });
+  if (ctx.method === 'GET' && rest.length > 0) {
+    const ref = 'refs/' + rest.join('/');
+    const sha = repo.refs.get(ref);
+    if (!sha) return notFound(ctx);
+    j(ctx, 200, { ref, object: { sha, type: objects.get(sha)?.type ?? 'commit' } });
+    return;
   }
-  // GET /api/v3/meta — public
-  if (method === 'GET' && path === '/api/v3/meta') {
-    return json(ctx, 200, { installed_version: '1.0.0', verifiable_password_authentication: false });
-  }
-
-  // Auth: everything below needs the bearer token (app.ts sets ctx.authenticated).
-  if (!ctx.authenticated) return error(ctx, 401, 'Requires authentication');
-
-  // GET /api/v3/user
-  if (method === 'GET' && path === '/api/v3/user') {
-    const viewer = store.viewer;
-    return json(ctx, 200, {
-      login: viewer.login,
-      id: viewer.id,
-      name: viewer.name,
-      email: viewer.email,
-      type: 'User',
-    });
-  }
-
-  // GET /api/v3/user/repos
-  if (method === 'GET' && path === '/api/v3/user/repos') {
-    const repos = store.viewerRepos();
-    const { page, total } = pageOf(repos, query);
-    const headers: Record<string, string> = {};
-    const link = linkHeader(ctx, '/api/v3/user/repos', query, total);
-    if (link) headers.link = link;
-    return json(ctx, 200, page.map((repo) => repoShape(ctx, repo)), headers);
-  }
-
-  // POST /api/v3/user/repos
-  if (method === 'POST' && path === '/api/v3/user/repos') {
-    if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-    const name = stringField(body, 'name');
-    if (!name) return error(ctx, 422, 'Validation Failed: name is required');
-    if (!/^[A-Za-z0-9._-]+$/.test(name)) return error(ctx, 422, 'Validation Failed: name is invalid');
-    const description = stringField(body, 'description') ?? '';
-    const isPrivate = body.private === true;
-    const repo = store.createRepo(store.viewer.login, name, description, isPrivate);
-    if (!repo) return error(ctx, 422, 'Validation Failed: name already exists on this account');
-    return json(ctx, 201, repoShape(ctx, repo));
-  }
-
-  // /api/v3/repos/{owner}/{repo}...
-  const repoMatch = path.match(/^\/api\/v3\/repos\/([^/]+)\/([^/]+)(?:\/(.*))?$/);
-  if (repoMatch) {
-    const owner = decodeURIComponent(repoMatch[1]);
-    const name = decodeURIComponent(repoMatch[2]);
-    const rest = repoMatch[3] ?? '';
-    const repo = ctx.store.getRepo(owner, name);
-    if (!repo) return error(ctx, 404, 'Not Found');
-
-    // GET /repos/{o}/{r}
-    if (method === 'GET' && rest === '') return json(ctx, 200, repoShape(ctx, repo));
-
-    // PATCH /repos/{o}/{r}
-    if (method === 'PATCH' && rest === '') {
-      if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-      const description = stringField(body, 'description');
-      if (description !== undefined) repo.description = description;
-      const newName = stringField(body, 'name');
-      if (newName && newName !== repo.name) {
-        if (store.getRepo(owner, newName)) return error(ctx, 422, 'Validation Failed: name already exists on this account');
-        store.repos.delete(store.repoKey(owner, repo.name));
-        repo.name = newName;
-        store.repos.set(store.repoKey(owner, repo.name), repo);
-      }
-      return json(ctx, 200, repoShape(ctx, repo));
-    }
-
-    // DELETE /repos/{o}/{r}
-    if (method === 'DELETE' && rest === '') {
-      store.deleteRepo(owner, name);
-      return noContent(ctx);
-    }
-
-    // GET /repos/{o}/{r}/branches
-    if (method === 'GET' && rest === 'branches') {
-      const branches: { name: string; commit: { sha: string } }[] = [];
-      for (const [refName, oid] of repo.refs) {
-        if (refName.startsWith('refs/heads/')) {
-          branches.push({ name: refName.slice('refs/heads/'.length), commit: { sha: oid } });
-        }
-      }
-      return json(ctx, 200, branches);
-    }
-
-    // GET /repos/{o}/{r}/branches/{branch}
-    const branchMatch = rest.match(/^branches\/(.+)$/);
-    if (method === 'GET' && branchMatch) {
-      const branch = decodeURIComponent(branchMatch[1]);
-      const tip = repo.branchTip(branch);
-      if (!tip) return error(ctx, 404, 'Branch not found');
-      return json(ctx, 200, { name: branch, commit: { sha: tip } });
-    }
-
-    // GET /repos/{o}/{r}/git/refs/heads/{branch}
-    const gitRefMatch = rest.match(/^git\/refs\/heads\/(.+)$/);
-    if (method === 'GET' && gitRefMatch) {
-      const branch = decodeURIComponent(gitRefMatch[1]);
-      const tip = repo.branchTip(branch);
-      if (!tip) return error(ctx, 404, 'Not Found');
-      return json(ctx, 200, { ref: `refs/heads/${branch}`, object: { sha: tip, type: 'commit' } });
-    }
-
-    // POST /repos/{o}/{r}/git/refs
-    if (method === 'POST' && rest === 'git/refs') {
-      if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-      const ref = stringField(body, 'ref');
-      const sha = stringField(body, 'sha');
-      if (!ref || !ref.startsWith('refs/') || !sha) return error(ctx, 422, 'Validation Failed');
-      if (!repo.lookup(sha)) return error(ctx, 422, 'Validation Failed: object does not exist');
-      if (repo.refs.has(ref)) return error(ctx, 422, 'Validation Failed: reference already exists');
-      repo.refs.set(ref, sha);
-      return json(ctx, 201, { ref, object: { sha, type: 'commit' } });
-    }
-
-    // GET /repos/{o}/{r}/commits
-    if (method === 'GET' && rest === 'commits') {
-      const shaParam = query.sha;
-      let tip: string | undefined;
-      if (shaParam) tip = repo.resolveRef(shaParam);
-      else tip = repo.branchTip(repo.defaultBranch);
-      if (shaParam && !tip) return error(ctx, 404, 'Not Found');
-      if (!tip) return json(ctx, 200, []);
-      const history = repo.commitHistory(tip);
-      const commits = history.map(({ oid, object }) => {
-        const parsed = parseCommit(object.data);
-        // GitHub's REST view returns the message without the trailing newline.
-        const message = parsed.message.endsWith('\n') ? parsed.message.slice(0, -1) : parsed.message;
-        return {
-          sha: oid,
-          commit: {
-            message,
-            author: { name: parsed.author, email: '', date: '' },
-            committer: { name: parsed.committer, email: '', date: '' },
-          },
-          parents: parsed.parents.map((p) => ({ sha: p })),
-        };
-      });
-      return json(ctx, 200, commits);
-    }
-
-    // PUT/GET/DELETE /repos/{o}/{r}/contents/{path}
-    const contentsMatch = rest.match(/^contents\/(.+)$/);
-    if (contentsMatch) {
-      const rawPath = contentsMatch[1];
-      const filePath = decodeURIComponent(rawPath);
-      if (method === 'GET') {
-        const refParam = query.ref;
-        let tip: string | undefined;
-        if (refParam) tip = repo.resolveRef(refParam);
-        else tip = repo.branchTip(repo.defaultBranch);
-        if (!tip) return error(ctx, 404, 'Not Found');
-        const tree = repo.treeOf(tip);
-        if (!tree) return error(ctx, 404, 'Not Found');
-        const file = repo.readPath(tree, filePath);
-        if (file) {
-          return json(ctx, 200, {
-            type: 'file',
-            encoding: 'base64',
-            size: file.data.length,
-            name: filePath.split('/').pop() ?? filePath,
-            path: filePath,
-            content: file.data.toString('base64'),
-            sha: file.oid,
-          });
-        }
-        const dir = repo.listDir(tree, filePath);
-        if (dir) {
-          return json(ctx, 200, dir.map((entry) => ({
-            type: entry.type,
-            name: entry.name,
-            path: entry.path,
-            sha: entry.sha,
-            size: 0,
-          })));
-        }
-        return error(ctx, 404, 'Not Found');
-      }
-      if (method === 'PUT') {
-        if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-        const message = stringField(body, 'message');
-        const content = stringField(body, 'content');
-        if (!message || content === undefined) return error(ctx, 422, 'Validation Failed');
-        let contentBytes: Buffer;
-        try {
-          contentBytes = Buffer.from(content, 'base64');
-        } catch {
-          return error(ctx, 422, 'Validation Failed: content is not valid base64');
-        }
-        const branch = stringField(body, 'branch') ?? repo.defaultBranch;
-        const givenSha = stringField(body, 'sha');
-        const tip = repo.branchTip(branch);
-        let isUpdate = false;
-        if (tip !== undefined) {
-          const tree = repo.treeOf(tip);
-          if (tree) {
-            const existing = repo.readPath(tree, filePath);
-            if (existing) {
-              isUpdate = true;
-              if (!givenSha || givenSha !== existing.oid) {
-                return error(ctx, 409, 'Conflict: sha does not match the current file');
-              }
-            }
-          }
-        } else if (branch !== repo.defaultBranch && repo.refs.size === 0) {
-          return error(ctx, 404, 'Not Found');
-        }
-        const blobOid = repo.putObject('blob', contentBytes);
-        const { commitOid } = commitFileChange(ctx, repo, branch, filePath, blobOid, message);
-        const status = isUpdate ? 200 : 201;
-        return json(ctx, status, {
-          content: {
-            type: 'file',
-            encoding: 'base64',
-            size: contentBytes.length,
-            name: filePath.split('/').pop() ?? filePath,
-            path: filePath,
-            content: contentBytes.toString('base64'),
-            sha: blobOid,
-          },
-          commit: { sha: commitOid, message },
-        });
-      }
-      if (method === 'DELETE') {
-        if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-        const message = stringField(body, 'message');
-        const givenSha = stringField(body, 'sha');
-        if (!message) return error(ctx, 422, 'Validation Failed');
-        const branch = stringField(body, 'branch') ?? repo.defaultBranch;
-        const tip = repo.branchTip(branch);
-        if (!tip) return error(ctx, 404, 'Not Found');
-        const tree = repo.treeOf(tip);
-        if (!tree) return error(ctx, 404, 'Not Found');
-        const existing = repo.readPath(tree, filePath);
-        if (!existing) return error(ctx, 404, 'Not Found');
-        if (givenSha && givenSha !== existing.oid) return error(ctx, 409, 'Conflict: sha does not match the current file');
-        const { commitOid } = commitFileChange(ctx, repo, branch, filePath, null, message);
-        return json(ctx, 200, { commit: { sha: commitOid, message } });
-      }
-    }
-
-    // POST /repos/{o}/{r}/labels
-    if (method === 'POST' && rest === 'labels') {
-      if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-      const name = stringField(body, 'name');
-      const color = stringField(body, 'color') ?? '000000';
-      if (!name) return error(ctx, 422, 'Validation Failed: name is required');
-      const label = { name, color, description: stringField(body, 'description') ?? '' };
-      repo.labels.set(name, label);
-      return json(ctx, 201, labelShape(label));
-    }
-
-    // POST /repos/{o}/{r}/issues  |  GET /repos/{o}/{r}/issues
-    if (rest === 'issues') {
-      if (method === 'POST') {
-        if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-        const title = stringField(body, 'title');
-        if (!title) return error(ctx, 422, 'Validation Failed: title is required');
-        const bodyText = stringField(body, 'body') ?? '';
-        const labelNames: string[] = [];
-        if (Array.isArray(body.labels)) {
-          for (const label of body.labels) {
-            if (typeof label !== 'string') return error(ctx, 422, 'Validation Failed: labels must be strings');
-            if (!repo.labels.has(label)) return error(ctx, 422, `Validation Failed: label "${label}" does not exist`);
-            labelNames.push(label);
-          }
-        }
-        const now = store.nowIso();
-        const issue: Issue = {
-          id: store.nextIssueId,
-          number: repo.nextIssue,
-          title,
-          body: bodyText,
-          state: 'open',
-          labels: labelNames,
-          comments: [],
-          createdSeq: store.nextSeq(),
-          createdAt: now,
-          updatedAt: now,
-        };
-        store.nextIssueId += 1;
-        repo.nextIssue += 1;
-        repo.issues.push(issue);
-        return json(ctx, 201, issueShape(ctx, repo, issue));
-      }
-      if (method === 'GET') {
-        const state = query.state ?? 'open';
-        let issues = repo.issues;
-        if (state === 'open') issues = issues.filter((i) => i.state === 'open');
-        else if (state === 'closed') issues = issues.filter((i) => i.state === 'closed');
-        const sort = query.sort ?? 'created';
-        const direction = query.direction ?? 'desc';
-        const sorted = [...issues];
-        if (sort === 'created') {
-          sorted.sort((a, b) => (direction === 'asc' ? a.createdSeq - b.createdSeq : b.createdSeq - a.createdSeq));
-        }
-        const { page, total } = pageOf(sorted, query);
-        const headers: Record<string, string> = {};
-        const link = linkHeader(ctx, `/api/v3/repos/${repo.fullName}/issues`, query, total);
-        if (link) headers.link = link;
-        return json(ctx, 200, page.map((issue) => issueShape(ctx, repo, issue)), headers);
-      }
-    }
-
-    // /repos/{o}/{r}/issues/{n}...
-    const issueMatch = rest.match(/^issues\/(\d+)(?:\/(.*))?$/);
-    if (issueMatch) {
-      const number = Number.parseInt(issueMatch[1], 10);
-      const sub = issueMatch[2] ?? '';
-      const issue = repo.issues.find((i) => i.number === number);
-      if (!issue) return error(ctx, 404, 'Not Found');
-      if (method === 'GET' && sub === '') return jsonRaw(ctx, 200, issueJson(ctx, repo, issue));
-      if (method === 'PATCH' && sub === '') {
-        if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-        const state = stringField(body, 'state');
-        if (state === 'open' || state === 'closed') issue.state = state;
-        const title = stringField(body, 'title');
-        if (title) issue.title = title;
-        const bodyText = stringField(body, 'body');
-        if (bodyText !== undefined) issue.body = bodyText;
-        issue.updatedAt = store.nowIso();
-        issue.jsonCache = null;
-        return json(ctx, 200, issueShape(ctx, repo, issue));
-      }
-      if (sub === 'comments') {
-        if (method === 'POST') {
-          if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-          const bodyText = stringField(body, 'body');
-          if (!bodyText) return error(ctx, 422, 'Validation Failed: body is required');
-          const comment = { id: store.nextCommentId, body: bodyText, createdAt: store.nowIso() };
-          store.nextCommentId += 1;
-          issue.comments.push(comment);
-          issue.jsonCache = null;
-          return json(ctx, 201, commentShape(ctx, repo, issue, comment));
-        }
-        if (method === 'GET') {
-          return json(ctx, 200, issue.comments.map((c) => commentShape(ctx, repo, issue, c)));
-        }
-      }
-    }
-
-    // POST /repos/{o}/{r}/pulls  |  GET /repos/{o}/{r}/pulls
-    if (rest === 'pulls') {
-      if (method === 'POST') {
-        if (!isRecord(body)) return error(ctx, 422, 'Validation Failed');
-        const title = stringField(body, 'title');
-        const head = stringField(body, 'head');
-        const base = stringField(body, 'base');
-        if (!title || !head || !base) return error(ctx, 422, 'Validation Failed');
-        const headSha = repo.branchTip(head);
-        const baseSha = repo.branchTip(base);
-        if (!headSha || !baseSha) return error(ctx, 422, 'Validation Failed: head or base branch does not exist');
-        const duplicate = repo.pulls.find((p) => p.state === 'open' && p.headRef === head && p.baseRef === base);
-        if (duplicate) return error(ctx, 422, 'Validation Failed: a pull request already exists for this branch');
-        const now = store.nowIso();
-        const pull: Pull = {
-          id: store.nextPullId,
-          number: repo.nextPull,
-          title,
-          body: stringField(body, 'body') ?? '',
-          state: 'open',
-          headRef: head,
-          headSha,
-          baseRef: base,
-          baseSha,
-          merged: false,
-          mergedAt: null,
-          mergeCommitSha: null,
-          createdSeq: store.nextSeq(),
-          createdAt: now,
-          updatedAt: now,
-        };
-        store.nextPullId += 1;
-        repo.nextPull += 1;
-        repo.pulls.push(pull);
-        return json(ctx, 201, pullShape(ctx, repo, pull));
-      }
-      if (method === 'GET') {
-        const state = query.state ?? 'open';
-        let pulls = repo.pulls;
-        if (state === 'open') pulls = pulls.filter((p) => p.state === 'open');
-        else if (state === 'closed') pulls = pulls.filter((p) => p.state === 'closed');
-        const sorted = [...pulls].sort((a, b) => b.createdSeq - a.createdSeq);
-        const { page, total } = pageOf(sorted, query);
-        const headers: Record<string, string> = {};
-        const link = linkHeader(ctx, `/api/v3/repos/${repo.fullName}/pulls`, query, total);
-        if (link) headers.link = link;
-        return json(ctx, 200, page.map((pull) => pullShape(ctx, repo, pull)), headers);
-      }
-    }
-
-    // /repos/{o}/{r}/pulls/{n}...
-    const pullMatch = rest.match(/^pulls\/(\d+)(?:\/(.*))?$/);
-    if (pullMatch) {
-      const number = Number.parseInt(pullMatch[1], 10);
-      const sub = pullMatch[2] ?? '';
-      const pull = repo.pulls.find((p) => p.number === number);
-      if (!pull) return error(ctx, 404, 'Not Found');
-      if (method === 'GET' && sub === '') return json(ctx, 200, pullShape(ctx, repo, pull));
-      if (method === 'GET' && sub === 'files') {
-        const baseTree = repo.treeOf(pull.baseSha);
-        const headTree = repo.treeOf(pull.headSha);
-        const diff = repo.diffTrees(baseTree, headTree);
-        const files = diff.map((change) => {
-          let additions = 0;
-          let deletions = 0;
-          if (change.status === 'added') {
-            const blob = change.newOid ? repo.lookup(change.newOid) : undefined;
-            additions = blob ? countLines(blob.data.toString('utf8')) : 0;
-          } else if (change.status === 'removed') {
-            const blob = change.oldOid ? repo.lookup(change.oldOid) : undefined;
-            deletions = blob ? countLines(blob.data.toString('utf8')) : 0;
-          } else {
-            const oldBlob = change.oldOid ? repo.lookup(change.oldOid) : undefined;
-            const newBlob = change.newOid ? repo.lookup(change.newOid) : undefined;
-            const counts = diffLines(
-              oldBlob ? oldBlob.data.toString('utf8') : '',
-              newBlob ? newBlob.data.toString('utf8') : '',
-            );
-            additions = counts.additions;
-            deletions = counts.deletions;
-          }
-          return {
-            sha: change.newOid ?? change.oldOid ?? '',
-            filename: change.path,
-            status: change.status,
-            additions,
-            deletions,
-            changes: additions + deletions,
-          };
-        });
-        return json(ctx, 200, files);
-      }
-      if (method === 'PUT' && sub === 'merge') {
-        const result = mergePullRequest(store, repo, pull);
-        if (!result.ok) return error(ctx, result.status ?? 405, result.message);
-        return json(ctx, 200, { sha: result.sha, merged: true, message: result.message });
-      }
-    }
-  }
-
-  return error(ctx, 404, 'Not Found');
+  return notFound(ctx);
 }

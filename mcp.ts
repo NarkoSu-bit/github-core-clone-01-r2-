@@ -1,121 +1,64 @@
-// mcp.ts — Model Context Protocol endpoint: JSON-RPC 2.0 over Streamable HTTP.
-// Revision 2026-07-28 via server/discover, plus the legacy initialize handshake.
+// mcp.ts — Model Context Protocol over Streamable HTTP (JSON-RPC 2.0). The
+// server answers the 2026-07-28 `server/discover` probe and the legacy
+// initialize handshake, lists the six tools, and executes them against the
+// same in-memory store the REST and GraphQL handlers use.
 
-import { type Store, type Repo } from './store.ts';
-import { mergePullRequest } from './rest.ts';
+import {
+  repos, repoKey, newRepo, repoJson, issueJson, pullJson,
+  filesOfCommit, diffFiles, hasConflict, makeCommit, treeFromFiles,
+  invalidateRepoGit, findMergeBase, allocIssueId, allocPullId,
+  VIEWER, FIXED_DATE,
+  type Repo,
+} from './store.ts';
+import { sendJson, sendEmpty, type Ctx } from './http-util.ts';
 
-export interface McpContext {
-  store: Store;
-  baseUrl: string;
-}
-
-const SERVER_NAME = 'makefun-git-forge';
+const SERVER_NAME = 'forge-mcp';
 const SERVER_VERSION = '1.0.0';
-const PROTOCOL_VERSION = '2026-07-28';
-const LEGACY_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+const SUPPORTED = ['2026-07-28', '2025-11-25'];
 
 interface ToolDef {
   name: string;
   description: string;
-  inputSchema: {
-    type: 'object';
-    properties: Record<string, { type: string; description?: string }>;
-    required?: string[];
-  };
-  handler: (ctx: McpContext, args: Record<string, unknown>) => { text: string; isError: boolean };
+  inputSchema: { type: 'object'; properties: Record<string, unknown>; required: string[] };
+  run: (args: Record<string, unknown>) => unknown;
 }
 
-function repoShape(ctx: McpContext, repo: Repo): Record<string, unknown> {
-  return {
-    id: repo.id,
-    name: repo.name,
-    full_name: repo.fullName,
-    owner: { login: repo.owner },
-    private: repo.isPrivate,
-    description: repo.description,
-    default_branch: repo.defaultBranch,
-    html_url: `${ctx.baseUrl}/${repo.fullName}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}`,
-  };
+function repoOf(owner: string, name: string): Repo | null {
+  return repos.get(repoKey(owner, name)) ?? null;
 }
 
-function issueShape(ctx: McpContext, repo: Repo, issue: { id: number; number: number; title: string; body: string; state: string; labels: string[] }): Record<string, unknown> {
-  return {
-    id: issue.id,
-    number: issue.number,
-    title: issue.title,
-    body: issue.body,
-    state: issue.state,
-    labels: issue.labels.map((name) => ({ name })),
-    html_url: `${ctx.baseUrl}/${repo.fullName}/issues/${issue.number}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}/issues/${issue.number}`,
-  };
+function toolResult(result: unknown): Record<string, unknown> {
+  return { content: [{ type: 'text', text: JSON.stringify(result) }], structuredContent: result, isError: false };
 }
 
-function pullShape(ctx: McpContext, repo: Repo, pull: { id: number; number: number; title: string; body: string; state: string; merged: boolean; mergedAt: string | null; mergeCommitSha: string | null; headRef: string; headSha: string; baseRef: string; baseSha: string }): Record<string, unknown> {
-  return {
-    id: pull.id,
-    number: pull.number,
-    title: pull.title,
-    body: pull.body,
-    state: pull.state,
-    merged: pull.merged,
-    merged_at: pull.mergedAt,
-    merge_commit_sha: pull.mergeCommitSha,
-    head: { ref: pull.headRef, sha: pull.headSha },
-    base: { ref: pull.baseRef, sha: pull.baseSha },
-    html_url: `${ctx.baseUrl}/${repo.fullName}/pull/${pull.number}`,
-    url: `${ctx.baseUrl}/api/v3/repos/${repo.fullName}/pulls/${pull.number}`,
-  };
-}
-
-function resultText(value: unknown): string {
-  return JSON.stringify(value);
-}
-
-function ok(value: unknown): { text: string; isError: boolean } {
-  return { text: resultText(value), isError: false };
-}
-
-function fail(message: string): { text: string; isError: boolean } {
-  return { text: resultText({ error: message }), isError: true };
-}
-
-/** Map the suite's argument names onto the schema's nearest property names. */
-function arg(args: Record<string, unknown>, ...names: string[]): unknown {
-  for (const name of names) if (args[name] !== undefined) return args[name];
-  return undefined;
-}
-
-function getRepo(ctx: McpContext, args: Record<string, unknown>): Repo | null {
-  const owner = arg(args, 'owner') as string | undefined;
-  const repoName = arg(args, 'repo', 'repository', 'name') as string | undefined;
-  if (!owner || !repoName) return null;
-  return ctx.store.getRepo(owner, repoName) ?? null;
+function toolError(message: string): Record<string, unknown> {
+  return { content: [{ type: 'text', text: message }], isError: true };
 }
 
 const TOOLS: ToolDef[] = [
   {
     name: 'create_repo',
-    description: 'Create a repository owned by the authenticated user.',
+    description: 'Create a repository for the authenticated user.',
     inputSchema: {
       type: 'object',
       properties: {
         name: { type: 'string', description: 'The repository name.' },
         description: { type: 'string', description: 'A short description of the repository.' },
         private: { type: 'boolean', description: 'Whether the repository is private.' },
-        full_name: { type: 'string', description: 'owner/repo, filled by the caller.' },
       },
       required: ['name'],
     },
-    handler: (ctx, args) => {
-      const name = arg(args, 'name') as string | undefined;
-      if (!name) return fail('Missing required argument: name');
-      const description = (arg(args, 'description') as string | undefined) ?? '';
-      const isPrivate = arg(args, 'private') === true;
-      const repo = ctx.store.createRepo(ctx.store.viewer.login, name, description, isPrivate);
-      if (!repo) return fail('Validation Failed: name already exists on this account');
-      return ok(repoShape(ctx, repo));
+    run: (args) => {
+      const name = typeof args.name === 'string' ? args.name : '';
+      if (name === '') throw new Error('Missing required argument: name');
+      if (repos.has(repoKey(VIEWER.login, name))) throw new Error(`Repository ${VIEWER.login}/${name} already exists`);
+      const repo = newRepo(
+        VIEWER.login,
+        name,
+        typeof args.description === 'string' ? args.description : '',
+        args.private === true,
+      );
+      return JSON.parse(repoJson(repo));
     },
   },
   {
@@ -124,16 +67,17 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
+        owner: { type: 'string', description: 'The repository owner.' },
         repo: { type: 'string', description: 'The repository name.' },
-        full_name: { type: 'string', description: 'owner/repo, filled by the caller.' },
       },
       required: ['owner', 'repo'],
     },
-    handler: (ctx, args) => {
-      const repo = getRepo(ctx, args);
-      if (!repo) return fail('Not Found');
-      return ok(repoShape(ctx, repo));
+    run: (args) => {
+      const owner = typeof args.owner === 'string' ? args.owner : '';
+      const name = typeof args.repo === 'string' ? args.repo : '';
+      const repo = repoOf(owner, name);
+      if (!repo) throw new Error(`Repository ${owner}/${name} not found`);
+      return JSON.parse(repoJson(repo));
     },
   },
   {
@@ -142,274 +86,259 @@ const TOOLS: ToolDef[] = [
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
+        owner: { type: 'string', description: 'The repository owner.' },
         repo: { type: 'string', description: 'The repository name.' },
         title: { type: 'string', description: 'The issue title.' },
         body: { type: 'string', description: 'The issue body.' },
-        full_name: { type: 'string', description: 'owner/repo, filled by the caller.' },
       },
       required: ['owner', 'repo', 'title'],
     },
-    handler: (ctx, args) => {
-      const repo = getRepo(ctx, args);
-      if (!repo) return fail('Not Found');
-      const title = arg(args, 'title') as string | undefined;
-      if (!title) return fail('Missing required argument: title');
-      const body = (arg(args, 'body') as string | undefined) ?? '';
-      const now = ctx.store.nowIso();
+    run: (args) => {
+      const owner = typeof args.owner === 'string' ? args.owner : '';
+      const name = typeof args.repo === 'string' ? args.repo : '';
+      const repo = repoOf(owner, name);
+      if (!repo) throw new Error(`Repository ${owner}/${name} not found`);
+      const title = typeof args.title === 'string' ? args.title : '';
+      if (title === '') throw new Error('Missing required argument: title');
       const issue = {
-        id: ctx.store.nextIssueId,
-        number: repo.nextIssue,
+        id: allocIssueId(),
+        number: repo.nextNumber++,
         title,
-        body,
+        body: typeof args.body === 'string' ? args.body : '',
         state: 'open' as const,
         labels: [] as string[],
-        comments: [] as never[],
-        createdSeq: ctx.store.nextSeq(),
-        createdAt: now,
-        updatedAt: now,
+        comments: [] as Array<{ id: number; body: string }>,
+        json: '',
+        gqlId: '',
       };
-      ctx.store.nextIssueId += 1;
-      repo.nextIssue += 1;
       repo.issues.push(issue);
-      return ok(issueShape(ctx, repo, issue));
+      return JSON.parse(issueJson(repo, issue));
     },
   },
   {
     name: 'list_issues',
-    description: 'List issues in a repository.',
+    description: 'List the issues of a repository.',
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
+        owner: { type: 'string', description: 'The repository owner.' },
         repo: { type: 'string', description: 'The repository name.' },
-        state: { type: 'string', description: 'Issue state filter: open, closed or all.' },
-        full_name: { type: 'string', description: 'owner/repo, filled by the caller.' },
+        state: { type: 'string', description: 'Filter by state: open, closed or all.' },
       },
       required: ['owner', 'repo'],
     },
-    handler: (ctx, args) => {
-      const repo = getRepo(ctx, args);
-      if (!repo) return fail('Not Found');
-      const state = (arg(args, 'state') as string | undefined) ?? 'open';
-      let issues = repo.issues;
-      if (state === 'open') issues = issues.filter((i) => i.state === 'open');
-      else if (state === 'closed') issues = issues.filter((i) => i.state === 'closed');
-      return ok({ issues: issues.map((issue) => issueShape(ctx, repo, issue)) });
+    run: (args) => {
+      const owner = typeof args.owner === 'string' ? args.owner : '';
+      const name = typeof args.repo === 'string' ? args.repo : '';
+      const repo = repoOf(owner, name);
+      if (!repo) throw new Error(`Repository ${owner}/${name} not found`);
+      const state = typeof args.state === 'string' ? args.state : 'all';
+      const list = state === 'all' ? repo.issues : repo.issues.filter((i) => i.state === state);
+      return list.map((i) => JSON.parse(issueJson(repo, i)));
     },
   },
   {
     name: 'create_pull_request',
-    description: 'Create a pull request in a repository.',
+    description: 'Open a pull request from one branch to another.',
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
+        owner: { type: 'string', description: 'The repository owner.' },
         repo: { type: 'string', description: 'The repository name.' },
         title: { type: 'string', description: 'The pull request title.' },
+        head: { type: 'string', description: 'The head branch.' },
+        base: { type: 'string', description: 'The base branch.' },
         body: { type: 'string', description: 'The pull request body.' },
-        head: { type: 'string', description: 'The head branch name.' },
-        base: { type: 'string', description: 'The base branch name.' },
-        full_name: { type: 'string', description: 'owner/repo, filled by the caller.' },
       },
       required: ['owner', 'repo', 'title', 'head', 'base'],
     },
-    handler: (ctx, args) => {
-      const repo = getRepo(ctx, args);
-      if (!repo) return fail('Not Found');
-      const title = arg(args, 'title') as string | undefined;
-      const head = arg(args, 'head') as string | undefined;
-      const base = arg(args, 'base') as string | undefined;
-      if (!title) return fail('Missing required argument: title');
-      if (!head) return fail('Missing required argument: head');
-      if (!base) return fail('Missing required argument: base');
-      const headSha = repo.branchTip(head);
-      const baseSha = repo.branchTip(base);
-      if (!headSha || !baseSha) return fail('Validation Failed: head or base branch does not exist');
-      const existing = repo.pulls.find((p) => p.state === 'open' && p.headRef === head && p.baseRef === base);
-      if (existing) return ok(pullShape(ctx, repo, existing));
-      const now = ctx.store.nowIso();
+    run: (args) => {
+      const owner = typeof args.owner === 'string' ? args.owner : '';
+      const name = typeof args.repo === 'string' ? args.repo : '';
+      const repo = repoOf(owner, name);
+      if (!repo) throw new Error(`Repository ${owner}/${name} not found`);
+      const title = typeof args.title === 'string' ? args.title : '';
+      const head = typeof args.head === 'string' ? args.head : '';
+      const base = typeof args.base === 'string' ? args.base : '';
+      if (title === '' || head === '' || base === '') throw new Error('Missing required argument: title, head or base');
+      const headSha = repo.refs.get(`refs/heads/${head}`);
+      const baseSha = repo.refs.get(`refs/heads/${base}`);
+      if (!headSha || !baseSha) throw new Error('head or base branch does not exist');
+      const mergeBase = findMergeBase(headSha, new Set([baseSha])) ?? baseSha;
+      const files = diffFiles(filesOfCommit(mergeBase), filesOfCommit(headSha));
       const pull = {
-        id: ctx.store.nextPullId,
-        number: repo.nextPull,
+        id: allocPullId(),
+        number: repo.nextNumber++,
         title,
-        body: (arg(args, 'body') as string | undefined) ?? '',
+        body: typeof args.body === 'string' ? args.body : '',
         state: 'open' as const,
-        headRef: head,
-        headSha,
-        baseRef: base,
-        baseSha,
         merged: false,
         mergedAt: null as string | null,
-        mergeCommitSha: null as string | null,
-        createdSeq: ctx.store.nextSeq(),
-        createdAt: now,
-        updatedAt: now,
+        mergeSha: null as string | null,
+        headRef: head,
+        baseRef: base,
+        headSha,
+        baseSha,
+        mergeBase,
+        files,
+        json: null as string | null,
+        gqlId: '',
       };
-      ctx.store.nextPullId += 1;
-      repo.nextPull += 1;
       repo.pulls.push(pull);
-      return ok(pullShape(ctx, repo, pull));
+      return JSON.parse(pullJson(repo, pull));
     },
   },
   {
     name: 'merge_pull_request',
-    description: 'Merge a pull request (squash) in a repository.',
+    description: 'Merge a pull request into its base branch.',
     inputSchema: {
       type: 'object',
       properties: {
-        owner: { type: 'string', description: 'The repository owner login.' },
+        owner: { type: 'string', description: 'The repository owner.' },
         repo: { type: 'string', description: 'The repository name.' },
-        pull_number: { type: 'number', description: 'The pull request number.' },
-        full_name: { type: 'string', description: 'owner/repo, filled by the caller.' },
+        pull_number: { type: 'integer', description: 'The pull request number.' },
       },
       required: ['owner', 'repo', 'pull_number'],
     },
-    handler: (ctx, args) => {
-      const repo = getRepo(ctx, args);
-      if (!repo) return fail('Not Found');
-      const number = Number(arg(args, 'pull_number', 'pullNumber', 'number'));
-      if (!Number.isInteger(number)) return fail('Missing required argument: pull_number');
+    run: (args) => {
+      const owner = typeof args.owner === 'string' ? args.owner : '';
+      const name = typeof args.repo === 'string' ? args.repo : '';
+      const repo = repoOf(owner, name);
+      if (!repo) throw new Error(`Repository ${owner}/${name} not found`);
+      const number = typeof args.pull_number === 'number' ? args.pull_number : -1;
       const pull = repo.pulls.find((p) => p.number === number);
-      if (!pull) return fail('Not Found');
-      const result = mergePullRequest(ctx.store, repo, pull);
-      if (!result.ok) return fail(result.message);
-      return ok({ merged: true, sha: result.sha, number, state: 'closed', message: result.message });
+      if (!pull) throw new Error(`Pull request ${number} not found`);
+      if (pull.state === 'closed') throw new Error('Pull request is already closed');
+      const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
+      const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
+      if (!baseTip || !headTip) throw new Error('head or base branch is missing');
+      if (hasConflict(filesOfCommit(pull.mergeBase), filesOfCommit(baseTip), filesOfCommit(headTip), pull.files)) {
+        throw new Error('Merge conflict');
+      }
+      const merged = new Map(filesOfCommit(baseTip));
+      for (const f of pull.files) {
+        const h = filesOfCommit(headTip).get(f.filename);
+        if (h) merged.set(f.filename, h);
+        else merged.delete(f.filename);
+      }
+      const treeOid = treeFromFiles(merged);
+      const commitOid = makeCommit(treeOid, [baseTip], `Merge pull request #${pull.number} from ${pull.headRef}`);
+      repo.refs.set(`refs/heads/${pull.baseRef}`, commitOid);
+      pull.state = 'closed';
+      pull.merged = true;
+      pull.mergedAt = FIXED_DATE;
+      pull.mergeSha = commitOid;
+      pull.json = null;
+      invalidateRepoGit(repo);
+      return { sha: commitOid, merged: true, message: `Merge pull request #${pull.number} from ${pull.headRef}` };
     },
   },
 ];
 
-function toolsListResult(): { tools: { name: string; description: string; inputSchema: ToolDef['inputSchema'] }[] } {
-  return {
-    tools: TOOLS.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      inputSchema: tool.inputSchema,
-    })),
-  };
+const TOOLS_LIST = TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }));
+
+function rpcResult(ctx: Ctx, id: unknown, result: unknown): void {
+  sendJson(ctx, 200, { jsonrpc: '2.0', id: id ?? null, result }, { 'mcp-session-id': 'forge-session-1' });
 }
 
-function findTool(name: string): ToolDef | undefined {
-  const normalized = name.replace(/^[^_]+__/, '').toLowerCase();
-  return TOOLS.find((tool) => tool.name.toLowerCase() === normalized || tool.name.toLowerCase().endsWith(normalized));
+function rpcError(ctx: Ctx, status: number, id: unknown, code: number, message: string): void {
+  sendJson(ctx, status, { jsonrpc: '2.0', id: id ?? null, error: { code, message } }, { 'mcp-session-id': 'forge-session-1' });
 }
 
-export interface McpResponse {
-  status: number;
-  headers: Record<string, string>;
-  body: Buffer | null;
-}
-
-function jsonRpcResponse(id: unknown, result: unknown): McpResponse {
-  return {
-    status: 200,
-    headers: { 'content-type': 'application/json' },
-    body: Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, result }), 'utf8'),
-  };
-}
-
-function jsonRpcError(id: unknown, code: number, message: string, status = 200): McpResponse {
-  return {
-    status,
-    headers: { 'content-type': 'application/json' },
-    body: Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: id ?? null, error: { code, message } }), 'utf8'),
-  };
-}
-
-/**
- * Handle one POST /mcp body. `authenticated` is false when no Authorization header was sent.
- * Returns null when the request is a notification (no response body, HTTP 202).
- */
-export function handleMcp(ctx: McpContext, bodyText: string, authenticated: boolean): McpResponse {
+export function handleMcp(ctx: Ctx): void {
+  if (ctx.method === 'DELETE') {
+    sendEmpty(ctx, 204);
+    return;
+  }
+  if (ctx.method !== 'POST') {
+    sendJson(ctx, 405, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Method Not Allowed' } });
+    return;
+  }
+  const auth = ctx.req.headers.authorization;
+  if (!auth || auth.trim() === '') {
+    rpcError(ctx, 401, null, -32000, 'Unauthorized');
+    return;
+  }
   let body: unknown;
   try {
-    body = JSON.parse(bodyText);
+    body = JSON.parse(ctx.body.toString('utf8'));
   } catch {
-    return jsonRpcError(null, -32700, 'Parse error', 400);
+    rpcError(ctx, 400, null, -32700, 'Parse error');
+    return;
   }
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
-    return jsonRpcError(null, -32600, 'Invalid Request');
+    rpcError(ctx, 400, null, -32600, 'Invalid Request');
+    return;
   }
-  const request = body as { jsonrpc?: string; id?: unknown; method?: string; params?: Record<string, unknown> };
-  const id = request.id ?? null;
-  const isNotification = request.id === undefined;
-  const method = request.method ?? '';
+  const req = body as Record<string, unknown>;
+  const id = req.id ?? null;
+  const method = typeof req.method === 'string' ? req.method : '';
+  const params = req.params && typeof req.params === 'object' && !Array.isArray(req.params)
+    ? (req.params as Record<string, unknown>)
+    : {};
 
-  // server/discover (2026-07-28 revision probe) — no auth required for discovery.
+  // Notifications carry no id: acknowledge with 202 and no body.
+  if (id === null && method.startsWith('notifications/')) {
+    sendEmpty(ctx, 202, { 'mcp-session-id': 'forge-session-1' });
+    return;
+  }
+
   if (method === 'server/discover') {
-    const serverInfo = { name: SERVER_NAME, version: SERVER_VERSION };
-    return jsonRpcResponse(id, {
-      supportedVersions: [PROTOCOL_VERSION, ...LEGACY_VERSIONS],
+    rpcResult(ctx, id, {
+      protocolVersion: '2026-07-28',
+      supportedVersions: SUPPORTED,
       capabilities: { tools: {} },
-      serverInfo,
-      _meta: { 'io.modelcontextprotocol/serverInfo': serverInfo },
+      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
+      instructions: 'A GitHub-core clone: repositories, issues and pull requests.',
     });
+    return;
   }
-
-  // Legacy handshake.
   if (method === 'initialize') {
-    const params = request.params ?? {};
-    const requested = typeof params.protocolVersion === 'string' ? params.protocolVersion : PROTOCOL_VERSION;
-    const supported = [PROTOCOL_VERSION, ...LEGACY_VERSIONS];
-    const chosen = supported.includes(requested) ? requested : PROTOCOL_VERSION;
-    const serverInfo = { name: SERVER_NAME, version: SERVER_VERSION };
-    return jsonRpcResponse(id, {
+    const offered = Array.isArray((params as Record<string, unknown>).protocolVersion)
+      ? ((params as Record<string, unknown>).protocolVersion as unknown[])
+      : [(params as Record<string, unknown>).protocolVersion];
+    let chosen = '2025-11-25';
+    for (const v of offered) if (typeof v === 'string' && SUPPORTED.includes(v)) { chosen = v; break; }
+    rpcResult(ctx, id, {
       protocolVersion: chosen,
       capabilities: { tools: {} },
-      serverInfo,
-      _meta: { 'io.modelcontextprotocol/serverInfo': serverInfo },
+      serverInfo: { name: SERVER_NAME, version: SERVER_VERSION },
     });
-  }
-  if (method === 'notifications/initialized' || method === 'notifications/cancelled') {
-    return { status: 202, headers: {}, body: null };
+    return;
   }
   if (method === 'ping') {
-    return jsonRpcResponse(id, {});
+    rpcResult(ctx, id, {});
+    return;
   }
-
-  // tools/list and tools/call require authentication.
-  if (!authenticated) {
-    return jsonRpcError(id, -32001, 'Unauthorized', 401);
-  }
-
   if (method === 'tools/list') {
-    return jsonRpcResponse(id, toolsListResult());
+    rpcResult(ctx, id, { tools: TOOLS_LIST });
+    return;
   }
-
   if (method === 'tools/call') {
-    const params = request.params ?? {};
     const name = typeof params.name === 'string' ? params.name : '';
-    const tool = findTool(name);
-    if (!tool) return jsonRpcError(id, -32602, `Unknown tool: ${name}`);
-    const args = (params.arguments ?? {}) as Record<string, unknown>;
-    // missing required arguments -> isError:true
-    const missing = (tool.inputSchema.required ?? []).filter((key) => args[key] === undefined);
+    const rawArgs = params.arguments;
+    const args = rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)
+      ? (rawArgs as Record<string, unknown>)
+      : {};
+    // The client maps arguments to the closest schema property name, so a
+    // tool is matched by suffix (case-insensitive) as well as by exact name.
+    const tool = TOOLS.find((t) => t.name === name)
+      ?? TOOLS.find((t) => name.toLowerCase().endsWith(t.name));
+    if (!tool) {
+      rpcError(ctx, 200, id, -32602, `Unknown tool: ${name}`);
+      return;
+    }
+    const missing = tool.inputSchema.required.filter((r) => args[r] === undefined || args[r] === null);
     if (missing.length > 0) {
-      return jsonRpcResponse(id, {
-        content: [{ type: 'text', text: resultText({ error: `Missing required argument: ${missing.join(', ')}` }) }],
-        structuredContent: { error: `Missing required argument: ${missing.join(', ')}` },
-        isError: true,
-      });
+      rpcResult(ctx, id, toolError(`Missing required arguments: ${missing.join(', ')}`));
+      return;
     }
-    let outcome: { text: string; isError: boolean };
     try {
-      outcome = tool.handler(ctx, args);
-    } catch (error) {
-      outcome = fail(error instanceof Error ? error.message : 'tool failed');
+      rpcResult(ctx, id, toolResult(tool.run(args)));
+    } catch (e) {
+      rpcResult(ctx, id, toolError(e instanceof Error ? e.message : String(e)));
     }
-    let structured: unknown;
-    try {
-      structured = JSON.parse(outcome.text);
-    } catch {
-      structured = { text: outcome.text };
-    }
-    return jsonRpcResponse(id, {
-      content: [{ type: 'text', text: outcome.text }],
-      structuredContent: structured,
-      isError: outcome.isError,
-    });
+    return;
   }
-
-  void isNotification;
-  return jsonRpcError(id, -32601, `Method not found: ${method}`);
+  rpcError(ctx, 200, id, -32601, `Method not found: ${method}`);
 }

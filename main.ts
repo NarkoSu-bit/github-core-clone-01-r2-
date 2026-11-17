@@ -1,52 +1,79 @@
-// main.ts — Lifecycle: bind an ephemeral port, register it with the suite, long-poll
-// $MAKEFUN_ENV_URL/done until the suite finishes, then exit 0. Without MAKEFUN_ENV_URL
-// (local development) it just serves on $PORT (default 8080) forever.
+// main.ts — the entry lifecycle. In a trial the harness sets MAKEFUN_ENV_URL:
+// bind an ephemeral port, POST {"port"} to $MAKEFUN_ENV_URL/register, then
+// long-poll GET $MAKEFUN_ENV_URL/done until {"done": true} and exit. Without
+// MAKEFUN_ENV_URL the entry runs in local-dev mode: it listens on $PORT
+// (default 3000) and serves forever, which is how the kit's local runner
+// exercises it.
 
-import { createApp, listen } from './app.ts';
+import { createApp } from './app.ts';
+import type { AddressInfo } from 'node:net';
+import type { Server } from 'node:http';
 
-const ENV_URL = process.env.MAKEFUN_ENV_URL;
+const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 
-async function sleep(ms: number): Promise<void> {
-  await new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function listen(server: Server, port: number): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, '127.0.0.1', () => resolve());
+  });
+}
+
+async function register(port: number): Promise<void> {
+  let delay = 250;
+  for (;;) {
+    try {
+      const res = await fetch(`${ENV_URL}/register`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ port }),
+        signal: AbortSignal.timeout(30_000),
+      });
+      if (res.ok) return;
+    } catch {
+      // The env is not up yet; retry with backoff.
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, 5_000);
+  }
+}
+
+async function waitForDone(): Promise<void> {
+  let delay = 250;
+  for (;;) {
+    try {
+      const res = await fetch(`${ENV_URL}/done`, { signal: AbortSignal.timeout(30_000) });
+      if (res.ok) {
+        const data = (await res.json()) as { done?: boolean };
+        if (data.done === true) return;
+      }
+    } catch {
+      // Transient; keep polling.
+    }
+    await sleep(delay);
+    delay = Math.min(delay * 2, 5_000);
+  }
 }
 
 async function main(): Promise<void> {
-  const requestedPort = Number.parseInt(process.env.PORT ?? '0', 10) || 0;
-  const app = createApp({ port: requestedPort });
-  const port = await listen(app, '0.0.0.0', requestedPort);
-  console.log(`forge listening on ${port}`);
-
-  if (!ENV_URL) {
-    console.log('no MAKEFUN_ENV_URL; serving locally');
+  const server = createApp();
+  if (ENV_URL === '') {
+    const port = Number(process.env.PORT ?? 3000);
+    await listen(server, port);
+    console.log(`[entry] local mode: listening on 127.0.0.1:${port}`);
     return;
   }
-
-  const registerUrl = `${ENV_URL.replace(/\/$/, '')}/register`;
-  const doneUrl = `${ENV_URL.replace(/\/$/, '')}/done`;
-  const registerResponse = await fetch(registerUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ port }),
-  });
-  if (!registerResponse.ok) {
-    throw new Error(`register failed: ${registerResponse.status}`);
-  }
-  console.log('registered with the suite');
-
-  for (;;) {
-    const response = await fetch(doneUrl);
-    if (response.ok) {
-      const body = (await response.json()) as { done?: boolean };
-      if (body.done) break;
-    }
-    await sleep(500);
-  }
-  console.log('suite done; exiting');
-  app.server.close();
-  process.exit(0);
+  await listen(server, 0);
+  const port = (server.address() as AddressInfo).port;
+  await register(port);
+  await waitForDone();
+  server.close();
 }
 
-main().catch((error) => {
-  console.error(error);
+main().catch((err: unknown) => {
+  console.error(err instanceof Error ? err.message : String(err));
   process.exit(1);
 });
