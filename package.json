@@ -1,1 +1,1 @@
-{"engines":{"node":">=22.18"},"license":"MIT","name":"github-core-clone-01-r3","private":true,"scripts":{"start":"node --experimental-strip-types main.ts"},"type":"module","version":"0.1.0"}
+{"description":"GitHub-compatible git forge for make.fun github-core-clone-01 (round 4)","license":"MIT","name":"github-core-clone-01-r4","private":true,"type":"module","version":"1.0.0"}
